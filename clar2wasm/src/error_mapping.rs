@@ -1,8 +1,8 @@
 use clarity::types::StacksEpochId;
 use clarity::vm::errors::{CheckErrors, Error, RuntimeErrorType, ShortReturnType, WasmError};
-use clarity::vm::types::ResponseData;
+use clarity::vm::types::{OptionalData, ResponseData};
 use clarity::vm::{ClarityVersion, Value};
-use wasmtime::{AsContextMut, Instance, Trap};
+use wasmtime::{AsContextMut, Instance, Memory, Trap};
 
 use crate::wasm_utils::{
     read_from_wasm_indirect, read_identifier_from_wasm, signature_from_string,
@@ -115,210 +115,161 @@ pub(crate) fn resolve_error(
     // In this case, runtime errors are handled
     // by being mapped to the corresponding ClarityWasm Errors.
     if let Some(Trap::UnreachableCodeReached) = e.root_cause().downcast_ref::<Trap>() {
-        return from_runtime_error_code(instance, &mut store, e, epoch_id, clarity_version);
+        return from_runtime_error_code(&instance, &mut store, e, epoch_id, clarity_version);
     }
 
     // All other errors are treated as general runtime errors.
     Error::Wasm(WasmError::Runtime(e))
 }
 
+/// Converts a runtime error code from WebAssembly execution into a Clarity `Error`.
+///
+/// This function interprets the runtime error code stored in the WebAssembly instance's global
+/// variables and converts it into an appropriate Clarity `Error` type. It handles various error
+/// scenarios including arithmetic errors, short returns, and other runtime issues.
+///
+/// # Arguments
+///
+/// * `instance` - A reference to the WebAssembly `Instance` that encountered the error.
+/// * `store` - A mutable reference to the WebAssembly store, which provides access to runtime data.
+/// * `e` - The original `wasmtime::Error` that triggered this error handling.
+/// * `epoch_id` - A reference to the current `StacksEpochId`, used for epoch-specific behavior.
+/// * `clarity_version` - A reference to the `ClarityVersion` in use, for version-specific handling.
+///
+/// # Returns
+///
+/// Returns a Clarity `Error` that corresponds to the runtime error encountered during WebAssembly execution.
+///
+/// # Panics
+///
+/// This function will panic in the following scenarios:
+/// - If it encounters an unsupported runtime error code.
+/// - If it fails to retrieve expected global variables or memory from the WebAssembly instance.
+/// - If it encounters an `ErrorMap::Panic` variant.
+///
 fn from_runtime_error_code(
-    instance: Instance,
+    instance: &Instance,
     mut store: impl AsContextMut,
     e: wasmtime::Error,
     epoch_id: &StacksEpochId,
     clarity_version: &ClarityVersion,
 ) -> Error {
-    let global = "runtime-error-code";
-    let runtime_error_code = instance
-        .get_global(&mut store, global)
-        .and_then(|glob| glob.get(&mut store).i32())
-        .unwrap_or_else(|| panic!("Could not find {global} global with i32 value"));
+    let runtime_error_code = get_global_i32(instance, &mut store, "runtime-error-code");
 
     match ErrorMap::from(runtime_error_code) {
         ErrorMap::NotClarityError => Error::Wasm(WasmError::Runtime(e)),
-        ErrorMap::ArithmeticOverflow => {
-            Error::Runtime(RuntimeErrorType::ArithmeticOverflow, Some(Vec::new()))
-        }
+        ErrorMap::ArithmeticOverflow => create_runtime_error(RuntimeErrorType::ArithmeticOverflow),
         ErrorMap::ArithmeticUnderflow => {
-            Error::Runtime(RuntimeErrorType::ArithmeticUnderflow, Some(Vec::new()))
+            create_runtime_error(RuntimeErrorType::ArithmeticUnderflow)
         }
-        ErrorMap::DivisionByZero => {
-            Error::Runtime(RuntimeErrorType::DivisionByZero, Some(Vec::new()))
+        ErrorMap::DivisionByZero => create_runtime_error(RuntimeErrorType::DivisionByZero),
+        ErrorMap::ArithmeticLog2Error => {
+            create_runtime_error(RuntimeErrorType::Arithmetic(LOG2_ERROR_MESSAGE.into()))
         }
-        ErrorMap::ArithmeticLog2Error => Error::Runtime(
-            RuntimeErrorType::Arithmetic(LOG2_ERROR_MESSAGE.into()),
-            Some(Vec::new()),
+        ErrorMap::ArithmeticSqrtiError => {
+            create_runtime_error(RuntimeErrorType::Arithmetic(SQRTI_ERROR_MESSAGE.into()))
+        }
+        ErrorMap::UnwrapFailure => create_runtime_error(RuntimeErrorType::UnwrapFailure),
+        ErrorMap::ArithmeticPowError => {
+            create_runtime_error(RuntimeErrorType::Arithmetic(POW_ERROR_MESSAGE.into()))
+        }
+        ErrorMap::NameAlreadyUsed => handle_name_already_used(instance, &mut store),
+        ErrorMap::ShortReturnExpectedValue => handle_short_return(
+            instance,
+            &mut store,
+            epoch_id,
+            clarity_version,
+            ShortReturnType::ExpectedValue,
         ),
-        ErrorMap::ArithmeticSqrtiError => Error::Runtime(
-            RuntimeErrorType::Arithmetic(SQRTI_ERROR_MESSAGE.into()),
-            Some(Vec::new()),
+        ErrorMap::ShortReturnAssertionFailure => handle_short_return(
+            instance,
+            &mut store,
+            epoch_id,
+            clarity_version,
+            ShortReturnType::AssertionFailed,
         ),
-        ErrorMap::UnwrapFailure => {
-            Error::Runtime(RuntimeErrorType::UnwrapFailure, Some(Vec::new()))
-        }
-        ErrorMap::Panic => {
-            panic!("An error has been detected in the code")
-        }
-        ErrorMap::ShortReturnAssertionFailure => {
-            let val_offset = instance
-                .get_global(&mut store, "runtime-error-value-offset")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-value-offset global with i32 value")
-                });
-
-            let type_ser_offset = instance
-                .get_global(&mut store, "runtime-error-type-ser-offset")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-type-ser-offset global with i32 value")
-                });
-
-            let type_ser_len = instance
-                .get_global(&mut store, "runtime-error-type-ser-len")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-type-ser-len global with i32 value")
-                });
-
-            let memory = instance
-                .get_memory(&mut store, "memory")
-                .unwrap_or_else(|| panic!("Could not find wasm instance memory"));
-
-            let type_ser_str =
-                read_identifier_from_wasm(memory, &mut store, type_ser_offset, type_ser_len)
-                    .unwrap_or_else(|e| panic!("Could not recover stringified type: {e}"));
-
-            let value_ty = signature_from_string(&type_ser_str, *clarity_version, *epoch_id)
-                .unwrap_or_else(|e| panic!("Could not recover thrown value: {e}"));
-
-            let clarity_val =
-                read_from_wasm_indirect(memory, &mut store, &value_ty, val_offset, *epoch_id)
-                    .unwrap_or_else(|e| panic!("Could not read thrown value from memory: {e}"));
-
-            Error::ShortReturn(ShortReturnType::AssertionFailed(clarity_val))
-        }
-        ErrorMap::ArithmeticPowError => Error::Runtime(
-            RuntimeErrorType::Arithmetic(POW_ERROR_MESSAGE.into()),
-            Some(Vec::new()),
-        ),
-        ErrorMap::NameAlreadyUsed => {
-            let runtime_error_arg_offset = instance
-                .get_global(&mut store, "runtime-error-arg-offset")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-arg-offset global with i32 value")
-                });
-
-            let runtime_error_arg_len = instance
-                .get_global(&mut store, "runtime-error-arg-len")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-arg-len global with i32 value")
-                });
-
-            let memory = instance
-                .get_memory(&mut store, "memory")
-                .unwrap_or_else(|| panic!("Could not find wasm instance memory"));
-            let arg_name = read_identifier_from_wasm(
-                memory,
-                &mut store,
-                runtime_error_arg_offset,
-                runtime_error_arg_len,
-            )
-            .unwrap_or_else(|e| panic!("Could not recover arg_name: {e}"));
-
-            Error::Unchecked(CheckErrors::NameAlreadyUsed(arg_name))
-        }
         ErrorMap::ShortReturnExpectedValueResponse => {
-            let val_offset = instance
-                .get_global(&mut store, "runtime-error-value-offset")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-value-offset global with i32 value")
-                });
-
-            let type_ser_offset = instance
-                .get_global(&mut store, "runtime-error-type-ser-offset")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-type-ser-offset global with i32 value")
-                });
-
-            let type_ser_len = instance
-                .get_global(&mut store, "runtime-error-type-ser-len")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-type-ser-len global with i32 value")
-                });
-
-            let memory = instance
-                .get_memory(&mut store, "memory")
-                .unwrap_or_else(|| panic!("Could not find wasm instance memory"));
-
-            let type_ser_str =
-                read_identifier_from_wasm(memory, &mut store, type_ser_offset, type_ser_len)
-                    .unwrap_or_else(|e| panic!("Could not recover stringified type: {e}"));
-
-            let value_ty = signature_from_string(&type_ser_str, *clarity_version, *epoch_id)
-                .unwrap_or_else(|e| panic!("Could not recover thrown value: {e}"));
-
-            let clarity_val =
-                read_from_wasm_indirect(memory, &mut store, &value_ty, val_offset, *epoch_id)
-                    .unwrap_or_else(|e| panic!("Could not read thrown value from memory: {e}"));
-
-            Error::ShortReturn(ShortReturnType::ExpectedValue(Value::Response(
-                ResponseData {
-                    committed: false,
-                    data: Box::new(clarity_val),
-                },
-            )))
+            handle_short_return_response(instance, &mut store, epoch_id, clarity_version)
         }
-        ErrorMap::ShortReturnExpectedValueOptional => {
-            Error::ShortReturn(ShortReturnType::ExpectedValue(Value::Optional(
-                clarity::vm::types::OptionalData { data: None },
-            )))
-        }
-        ErrorMap::ShortReturnExpectedValue => {
-            let val_offset = instance
-                .get_global(&mut store, "runtime-error-value-offset")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-value-offset global with i32 value")
-                });
-
-            let type_ser_offset = instance
-                .get_global(&mut store, "runtime-error-type-ser-offset")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-type-ser-offset global with i32 value")
-                });
-
-            let type_ser_len = instance
-                .get_global(&mut store, "runtime-error-type-ser-len")
-                .and_then(|glob| glob.get(&mut store).i32())
-                .unwrap_or_else(|| {
-                    panic!("Could not find $runtime-error-type-ser-len global with i32 value")
-                });
-
-            let memory = instance
-                .get_memory(&mut store, "memory")
-                .unwrap_or_else(|| panic!("Could not find wasm instance memory"));
-
-            let type_ser_str =
-                read_identifier_from_wasm(memory, &mut store, type_ser_offset, type_ser_len)
-                    .unwrap_or_else(|e| panic!("Could not recover stringified type: {e}"));
-
-            let value_ty = signature_from_string(&type_ser_str, *clarity_version, *epoch_id)
-                .unwrap_or_else(|e| panic!("Could not recover thrown value: {e}"));
-
-            let clarity_val =
-                read_from_wasm_indirect(memory, &mut store, &value_ty, val_offset, *epoch_id)
-                    .unwrap_or_else(|e| panic!("Could not read thrown value from memory: {e}"));
-
-            Error::ShortReturn(ShortReturnType::ExpectedValue(clarity_val))
-        }
+        ErrorMap::ShortReturnExpectedValueOptional => Error::ShortReturn(
+            ShortReturnType::ExpectedValue(Value::Optional(OptionalData { data: None })),
+        ),
+        ErrorMap::Panic => panic!("An error has been detected in the code"),
         _ => panic!("Runtime error code {} not supported", runtime_error_code),
     }
+}
+
+fn get_global_i32(instance: &Instance, store: &mut impl AsContextMut, name: &str) -> i32 {
+    instance
+        .get_global(&mut *store, name)
+        .and_then(|glob| glob.get(store).i32())
+        .unwrap_or_else(|| panic!("Could not find ${} global with i32 value", name))
+}
+
+fn create_runtime_error(error_type: RuntimeErrorType) -> Error {
+    Error::Runtime(error_type, Some(Vec::new()))
+}
+
+fn handle_name_already_used(instance: &Instance, store: &mut impl AsContextMut) -> Error {
+    let offset = get_global_i32(instance, store, "runtime-error-arg-offset");
+    let len = get_global_i32(instance, store, "runtime-error-arg-len");
+    let memory = get_memory(instance, store);
+    let arg_name = read_identifier_from_wasm(memory, store, offset, len)
+        .unwrap_or_else(|e| panic!("Could not recover arg_name: {}", e));
+    Error::Unchecked(CheckErrors::NameAlreadyUsed(arg_name))
+}
+
+fn handle_short_return(
+    instance: &Instance,
+    store: &mut impl AsContextMut,
+    epoch_id: &StacksEpochId,
+    clarity_version: &ClarityVersion,
+    return_type: fn(Value) -> ShortReturnType,
+) -> Error {
+    let val_offset = get_global_i32(instance, store, "runtime-error-value-offset");
+    let type_ser_offset = get_global_i32(instance, store, "runtime-error-type-ser-offset");
+    let type_ser_len = get_global_i32(instance, store, "runtime-error-type-ser-len");
+    let memory = get_memory(instance, store);
+
+    let type_ser_str = read_identifier_from_wasm(memory, store, type_ser_offset, type_ser_len)
+        .unwrap_or_else(|e| panic!("Could not recover stringified type: {}", e));
+
+    let value_ty = signature_from_string(&type_ser_str, *clarity_version, *epoch_id)
+        .unwrap_or_else(|e| panic!("Could not recover thrown value: {}", e));
+
+    let clarity_val = read_from_wasm_indirect(memory, store, &value_ty, val_offset, *epoch_id)
+        .unwrap_or_else(|e| panic!("Could not read thrown value from memory: {}", e));
+
+    Error::ShortReturn(return_type(clarity_val))
+}
+
+fn handle_short_return_response(
+    instance: &Instance,
+    store: &mut impl AsContextMut,
+    epoch_id: &StacksEpochId,
+    clarity_version: &ClarityVersion,
+) -> Error {
+    let clarity_val = handle_short_return(
+        instance,
+        store,
+        epoch_id,
+        clarity_version,
+        ShortReturnType::ExpectedValue,
+    );
+    if let Error::ShortReturn(ShortReturnType::ExpectedValue(val)) = clarity_val {
+        Error::ShortReturn(ShortReturnType::ExpectedValue(Value::Response(
+            ResponseData {
+                committed: false,
+                data: Box::new(val),
+            },
+        )))
+    } else {
+        panic!("Unexpected error type in handle_short_return_response")
+    }
+}
+
+fn get_memory(instance: &Instance, store: &mut impl AsContextMut) -> Memory {
+    instance
+        .get_memory(store, "memory")
+        .unwrap_or_else(|| panic!("Could not find wasm instance memory"))
 }
