@@ -249,14 +249,14 @@ fn handle_short_return_response(
     epoch_id: &StacksEpochId,
     clarity_version: &ClarityVersion,
 ) -> Error {
-    let clarity_val = handle_short_return(
+    let resp_err = handle_short_return(
         instance,
         store,
         epoch_id,
         clarity_version,
         ShortReturnType::ExpectedValue,
     );
-    if let Error::ShortReturn(ShortReturnType::ExpectedValue(val)) = clarity_val {
+    if let Error::ShortReturn(ShortReturnType::ExpectedValue(val)) = resp_err {
         Error::ShortReturn(ShortReturnType::ExpectedValue(Value::Response(
             ResponseData {
                 committed: false,

@@ -240,18 +240,22 @@ proptest! {
     #![proptest_config(super::runtime_config())]
 
     #[test]
-    fn crosscheck_try_response(bool in any::<bool>(), val in PropValue::any()) {
+    fn crosscheck_try_response(
+        bool in any::<bool>(),
+        val in PropValue::any(),
+        throw_val in PropValue::any(),
+    ) {
         let expected = if bool {
             Ok(Some(Value::from(val.clone())))
         } else {
             Err(Error::ShortReturn(ShortReturnType::ExpectedValue(Value::Response(ResponseData {
                 committed: false,
-                data: Box::new(Value::from(val.clone()))
+                data: Box::new(Value::from(throw_val.clone()))
             }))))
         };
 
         crosscheck(
-            &format!("(try! (if {bool} (ok {val}) (err {val})))"),
+            &format!("(try! (if {bool} (ok {val}) (err {throw_val})))"),
             expected
         );
     }
@@ -260,19 +264,20 @@ proptest! {
     #[test]
     fn crosscheck_try_response_inside_function(
         bool in any::<bool>(),
-        val in PropValue::any()
+        val in PropValue::any(),
+        throw_val in PropValue::any()
     ) {
         let expected = if bool {
             Ok(Some(Value::from(val.clone())))
         } else {
             Err(Error::ShortReturn(ShortReturnType::ExpectedValue(Value::Response(ResponseData {
                 committed: false,
-                data: Box::new(Value::from(val.clone()))
+                data: Box::new(Value::from(throw_val.clone()))
             }))))
         };
 
         crosscheck(
-            &format!("(define-private (foo) (if {bool} (ok {val}) (err {val}))) (try! (foo))"),
+            &format!("(define-private (foo) (if {bool} (ok {val}) (err {throw_val}))) (try! (foo))"),
             expected
         );
     }

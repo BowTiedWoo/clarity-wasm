@@ -821,11 +821,7 @@ impl ComplexWord for Try {
                 for local in &err_locals {
                     throw_branch.local_get(*local);
                 }
-                generator.return_early(
-                    &mut throw_branch,
-                    _expr,
-                    ErrorMap::ShortReturnExpectedValueResponse,
-                )?;
+                generator.return_early_for_try(&mut throw_branch, err_type)?;
 
                 let throw_branch_id = throw_branch.id();
 
@@ -1276,6 +1272,20 @@ mod tests {
             "(try! (if false (some u1) none))",
             Err(Error::ShortReturn(ShortReturnType::ExpectedValue(
                 Value::Optional(clarity::vm::types::OptionalData { data: None }),
+            ))),
+        )
+    }
+
+    #[test]
+    fn try_response_different_types() {
+        crosscheck(
+            // "(try! (if false (ok 0xaa) (err true)))",
+            "(define-private (foo) (if false (ok 0xaa) (err (list 0x4343)))) (try! (foo))",
+            Err(Error::ShortReturn(ShortReturnType::ExpectedValue(
+                Value::Response(ResponseData {
+                    committed: false,
+                    data: Box::new(Value::UInt(555)),
+                }),
             ))),
         )
     }

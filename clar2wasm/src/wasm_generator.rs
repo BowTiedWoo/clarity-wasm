@@ -666,21 +666,19 @@ impl WasmGenerator {
         }
 
         match runtime_error {
-            ErrorMap::ShortReturnAssertionFailure
-            | ErrorMap::ShortReturnExpectedValue
-            | ErrorMap::ShortReturnExpectedValueResponse => {
+            ErrorMap::ShortReturnAssertionFailure | ErrorMap::ShortReturnExpectedValue => {
                 // Handle short return with value
-                let ty = self
+                let throw_ty = self
                     .get_expr_type(expr)
                     .ok_or_else(|| {
-                        GeneratorError::TypeError("asserts! thrown-value must be typed".to_owned())
+                        GeneratorError::TypeError("thrown value must be typed".to_owned())
                     })?
                     .clone();
 
-                let (val_offset, _) = self.create_call_stack_local(builder, &ty, false, true);
-                self.write_to_memory(builder, val_offset, 0, &ty)?;
+                let (val_offset, _) = self.create_call_stack_local(builder, &throw_ty, false, true);
+                self.write_to_memory(builder, val_offset, 0, &throw_ty)?;
 
-                let serialized_ty = self.type_for_serialization(&ty).to_string();
+                let serialized_ty = self.type_for_serialization(&throw_ty).to_string();
 
                 // Validate serialized type
                 signature_from_string(
@@ -720,6 +718,50 @@ impl WasmGenerator {
                 ))
             }
         }
+
+        builder.unreachable();
+
+        Ok(())
+    }
+
+    pub fn return_early_for_try(
+        &mut self,
+        builder: &mut InstrSeqBuilder,
+        throw_ty: &TypeSignature,
+    ) -> Result<(), GeneratorError> {
+        if let Some(block_id) = self.early_return_block_id {
+            builder.instr(walrus::ir::Br { block: block_id });
+            return Ok(());
+        }
+
+        let (val_offset, _) = self.create_call_stack_local(builder, throw_ty, false, true);
+        self.write_to_memory(builder, val_offset, 0, throw_ty)?;
+
+        let serialized_ty = self.type_for_serialization(throw_ty).to_string();
+
+        // Validate serialized type
+        signature_from_string(
+            &serialized_ty,
+            self.contract_analysis.clarity_version,
+            self.contract_analysis.epoch,
+        )
+        .map_err(|e| GeneratorError::TypeError(format!("type cannot be deserialized: {e:?}")))?;
+
+        let (type_ser_offset, type_ser_len) =
+            self.add_clarity_string_literal(&CharType::ASCII(ASCIIData {
+                data: serialized_ty.bytes().collect(),
+            }))?;
+
+        // Set runtime error globals
+        builder
+            .local_get(val_offset)
+            .global_set(get_global(&self.module, "runtime-error-value-offset")?)
+            .i32_const(type_ser_offset as i32)
+            .global_set(get_global(&self.module, "runtime-error-type-ser-offset")?)
+            .i32_const(type_ser_len as i32)
+            .global_set(get_global(&self.module, "runtime-error-type-ser-len")?)
+            .i32_const(ErrorMap::ShortReturnExpectedValueResponse as i32)
+            .call(self.func_by_name("stdlib.runtime-error"));
 
         builder.unreachable();
 
